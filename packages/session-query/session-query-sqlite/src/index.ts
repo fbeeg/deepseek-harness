@@ -232,6 +232,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _persistenceBinding: PersistenceBinding = { identity: Symbol() }
   private _lastPersistenceIdentity: symbol | undefined
   private _persistenceEpoch = 0
+  /** Sessions whose stored log failed to read, keyed to the revision that failed; retried when the revision changes. */
+  private readonly _unreadable = new Map<SessionId, string>()
   private _globalGeneration = 0
   private _localGeneration = 0
   private _tail: Promise<void> = Promise.resolve()
@@ -519,16 +521,31 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
             // live-preferred.
             if (initiallyLive.has(entry.header.id) || this.ctx.sessions.get(entry.header.id) !== undefined) continue
             assertNotAborted(signal)
-            const loaded = await readColdSessionLog(persistence, entry.header.id, signal)
-            assertNotAborted(signal)
-            assertSessionHeadersCompatible(entry.header, loaded.header)
-            entry.loaded = observeSession(loaded.header, loaded.inheritedEventCount, loaded.events)
+            if (this._unreadable.get(entry.header.id) === entry.revision) continue
+            try {
+              const loaded = await readColdSessionLog(persistence, entry.header.id, signal)
+              assertNotAborted(signal)
+              assertSessionHeadersCompatible(entry.header, loaded.header)
+              entry.loaded = observeSession(loaded.header, loaded.inheritedEventCount, loaded.events)
+            } catch (error: unknown) {
+              // One unreadable log must not make every search fail. The session stays
+              // unindexed (and an indexed row it already has is kept) until its log
+              // changes; aborts and a moved persistence binding keep their usual paths.
+              if (isAbort(error) || signal?.aborted || this._persistenceBinding !== persistenceBinding) throw error
+              this._unreadable.set(entry.header.id, entry.revision)
+              this.ctx.logger.warn(`session-query: skipped unreadable session log ${entry.header.id}: ${errorMessage(error)}`)
+            }
           }
           assertNotAborted(signal)
           const afterSnapshots = await persistence.list(listOptions)
           assertNotAborted(signal)
           const after = materializePersistenceSnapshots(afterSnapshots)
-          if (!samePersistenceSnapshots(persisted, after)) continue
+          // Live sessions are indexed from memory, never from their log, so a log that is
+          // still being appended to must not invalidate the observation (a busy instance
+          // would otherwise never stabilise). Only cold sessions are compared.
+          const isLive = (id: SessionId): boolean =>
+            initiallyLive.has(id) || this.ctx.sessions.get(id) !== undefined
+          if (!samePersistenceSnapshots(withoutLive(persisted, isLive), withoutLive(after, isLive))) continue
           if (this._persistenceBinding !== persistenceBinding) continue
         } catch (error: unknown) {
           if (isAbort(error) || signal?.aborted) {
@@ -906,6 +923,13 @@ function materializePersistenceSnapshots(
     result.set(header.id, { header, revision: snapshot.revision })
   }
   return result
+}
+
+function withoutLive(
+  snapshots: ReadonlyMap<SessionId, ObservedPersistedSession>,
+  isLive: (id: SessionId) => boolean,
+): ReadonlyMap<SessionId, ObservedPersistedSession> {
+  return new Map([...snapshots].filter(([id]) => !isLive(id)))
 }
 
 function samePersistenceSnapshots(

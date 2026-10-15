@@ -98,6 +98,7 @@ class TestHandle implements SessionHandle {
     TestPersistence.reads.set(this.id, (TestPersistence.reads.get(this.id) ?? 0) + 1)
     TestPersistence.readSignals.push(options?.signal)
     if (TestPersistence.failure !== undefined) throw TestPersistence.failure
+    if (TestPersistence.unreadable.has(this.id)) throw new Error('stored log is corrupt')
     const entry = TestPersistence.entries.get(this.id)
     if (entry === undefined) throw new SessionPersistenceNotFoundError(this.id)
     await TestPersistence.readEffect?.(entry, options?.signal)
@@ -144,6 +145,7 @@ class TestPersistence extends SessionPersistence {
   static listEffect: ((signal?: AbortSignal) => void | Promise<void>) | undefined
   static listOverride: (() => SessionPersistenceSnapshot[]) | undefined
   static failure: unknown
+  static unreadable = new Set<SessionIdType>()
 
   static reset(entries: readonly { meta: SessionHeader; events: SessionEvent[] }[] = []): void {
     this.entries = new Map()
@@ -158,6 +160,7 @@ class TestPersistence extends SessionPersistence {
     this.listEffect = undefined
     this.listOverride = undefined
     this.failure = undefined
+    this.unreadable = new Set()
   }
 
   static set(entry: { meta: SessionHeader; events: SessionEvent[] }): void {
@@ -1039,6 +1042,60 @@ describe('SQLite reconciliation and source lifecycle', () => {
     expect(page.items.map(item => item.header.id).sort()).toEqual([added.id, first.id].sort())
     expect(TestPersistence.reads.get(first.id)).toBe(2)
     expect(TestPersistence.reads.get(added.id)).toBe(1)
+  })
+
+  it('skips one unreadable cold log instead of failing every search', async () => {
+    const good = header('readable')
+    const broken = header('corrupt')
+    TestPersistence.reset([
+      { meta: good, events: messageEvents('good needle') },
+      { meta: broken, events: messageEvents('broken needle') },
+    ])
+    const ctx = await liveContext()
+    await ctx.plugin(TestPersistence)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
+    TestPersistence.unreadable.add(broken.id)
+
+    const page = await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    expect(page.items.map(item => item.header.id)).toEqual([good.id])
+    expect(warn).toHaveBeenCalledTimes(1)
+
+    await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    expect(TestPersistence.reads.get(broken.id)).toBe(1)
+    expect(warn).toHaveBeenCalledTimes(1)
+
+    // A new revision of the log is read again.
+    TestPersistence.unreadable.clear()
+    TestPersistence.set({ meta: broken, events: messageEvents('repaired needle') })
+    const repaired = await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    expect(repaired.items.map(item => item.header.id).sort()).toEqual([broken.id, good.id].sort())
+  })
+
+  it('does not let a live session whose log keeps growing block the observation', async () => {
+    const live = header('busy-live', 5)
+    const cold = header('quiet-cold', 6)
+    TestPersistence.reset([
+      { meta: live, events: messageEvents('live log needle') },
+      { meta: cold, events: messageEvents('cold needle') },
+    ])
+    const ctx = await liveContext()
+    const session = ctx.sessions.prepare(live.id, {
+      seed: messageEvents('live memory needle'),
+      meta: { createdAt: live.createdAt },
+    })
+    const detach = ctx.sessions.enter(session)
+    ctx.sessions.announce(session)
+    await ctx.plugin(TestPersistence)
+    let lists = 0
+    TestPersistence.listEffect = () => {
+      lists += 1
+      TestPersistence.set({ meta: live, events: messageEvents(`live log needle ${lists}`) })
+    }
+
+    const page = await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    expect(page.items.map(item => item.header.id).sort()).toEqual([cold.id, live.id].sort())
+    expect(lists).toBe(2)
+    detach()
   })
 
   it('fails after one retry when persistence snapshots keep changing', async () => {
