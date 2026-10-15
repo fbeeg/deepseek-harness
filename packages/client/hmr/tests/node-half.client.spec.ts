@@ -337,3 +337,29 @@ it('broadcasts the desired graph without waiting for Host activation or cleanup'
     await ctx.fiber.dispose()
   }
 })
+
+it('writes a comment heartbeat to idle event streams and stops it on dispose', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  try {
+    const bundle = join(dir, 'a.js')
+    writeFileSync(bundle, 'a')
+    const routes: WebRoute[] = []
+    const fiber = await mount(fakeClientModuleHost(new Map([['a', bundle]])), fakeHttpServer(routes))
+    const lines: string[] = []
+    const response = Object.assign(new EventEmitter(), {
+      writeHead: vi.fn(), write: (line: string) => { lines.push(line) },
+      destroy: vi.fn(), end: vi.fn(),
+    })
+    await routes[0]!.handler({ method: 'GET' } as IncomingMessage, response as unknown as ServerResponse)
+    expect(lines).toHaveLength(2)
+    vi.advanceTimersByTime(25_000)
+    expect(lines.at(-1)).toBe(': hb\n\n')
+    response.emit('close')
+    vi.advanceTimersByTime(25_000)
+    expect(lines).toHaveLength(3)
+    await fiber.dispose()
+    expect(vi.getTimerCount()).toBe(0)
+  } finally {
+    vi.useRealTimers()
+  }
+})

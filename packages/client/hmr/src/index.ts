@@ -156,6 +156,8 @@ export function apply(ctx: Context, config: Config): void {
   }, 'client-hmr: bundle watches')
 
   // --- /plugins/events SSE channel ----------------------------------------
+  const HEARTBEAT_LINE = ': hb\n\n'
+  const HEARTBEAT_INTERVAL_MS = 25_000
   const connections = new Set<ServerResponse>()
 
   const publishGraph = (): void => {
@@ -193,6 +195,15 @@ export function apply(ctx: Context, config: Config): void {
       },
     })
     const unsubscribeGraph = ctx.clientModules.onGraphChanged(publishGraph)
+    // A quiet channel carries no frame between rebuilds. Reverse proxies and tunnels cancel
+    // idle HTTP streams after about 100 s, which surfaces as a reconnect loop in the browser.
+    // A bare comment line is ignored by EventSource and keeps the stream alive.
+    const heartbeat = setInterval(() => {
+      for (const res of connections) {
+        try { res.write(HEARTBEAT_LINE) } catch { /* the connection is already tearing down */ }
+      }
+    }, HEARTBEAT_INTERVAL_MS)
+    heartbeat.unref()
     const unsubscribe = ctx.clientModules.onRebuilt((id, rev) => {
       const line = sseData({ type: 'rebuilt', id, rev })
       for (const res of connections) res.write(line)
@@ -200,6 +211,7 @@ export function apply(ctx: Context, config: Config): void {
     return () => {
       unsubscribeGraph()
       unsubscribe()
+      clearInterval(heartbeat)
       disposeRoute()
       for (const res of connections) res.destroy()
       connections.clear()
