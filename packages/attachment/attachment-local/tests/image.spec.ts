@@ -88,4 +88,18 @@ describe('raster decoding', () => {
     }).tiff().toBuffer()
     await expect(probeImage(unsupported)).rejects.toMatchObject({ code: 'INVALID_IMAGE' })
   })
+
+  it('refuses bytes without a supported raster signature before libvips sees them', async () => {
+    // libvips sniffs `<svg` anywhere in the buffer; concurrent SVG-loader parses of
+    // non-image data used to corrupt the native heap and abort the process.
+    const page = new TextEncoder().encode('<!doctype html><html><body><svg xmlns="http://www.w3.org/2000/svg"></svg></body></html>')
+    const rejected = await Promise.allSettled(
+      Array.from({ length: 8 }, (_, index) => (index % 2 === 0 ? detectImage(page) : probeImage(page))),
+    )
+    for (const result of rejected) {
+      expect(result).toMatchObject({ status: 'rejected', reason: { code: 'INVALID_IMAGE' } })
+    }
+    const riff = Uint8Array.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45])
+    await expect(detectImage(riff)).rejects.toMatchObject({ code: 'INVALID_IMAGE' })
+  })
 })

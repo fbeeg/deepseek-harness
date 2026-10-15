@@ -60,6 +60,27 @@ function carriesRetainedMetadata(metadata: Awaited<ReturnType<Sharp['metadata']>
     || metadata.orientation !== undefined
 }
 
+/**
+ * Reject bytes that do not start with a PNG, JPEG, GIF or WebP signature
+ * before libvips is involved. libvips sniffs `<svg` anywhere in a buffer and
+ * falls back to its SVG loader; two such parses running concurrently corrupt
+ * the native heap and abort the process (glibc "double free or corruption").
+ * This module only admits the four formats in {@link MEDIA_TYPES} anyway, so
+ * nothing accepted today is refused.
+ * @param data - candidate encoded image bytes.
+ */
+function assertRasterSignature(data: Uint8Array): void {
+  const at = (offset: number, ...bytes: number[]): boolean =>
+    data.length >= offset + bytes.length && bytes.every((value, index) => data[offset + index] === value)
+  const png = at(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+  const jpeg = at(0, 0xff, 0xd8, 0xff)
+  const gif = at(0, 0x47, 0x49, 0x46, 0x38) && (data[4] === 0x37 || data[4] === 0x39) && data[5] === 0x61
+  const webp = at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)
+  if (!png && !jpeg && !gif && !webp) {
+    throw new AttachmentError('Unsupported or malformed image data.', 'INVALID_IMAGE')
+  }
+}
+
 async function imageMetadata(image: Sharp): Promise<DetectedImage> {
   const metadata = await image.metadata()
   const mediaType = MEDIA_TYPES[metadata.format as string]
@@ -90,6 +111,7 @@ async function imageMetadata(image: Sharp): Promise<DetectedImage> {
  * @returns verified format and dimensions.
  */
 export async function probeImage(data: Uint8Array): Promise<DetectedImage> {
+  assertRasterSignature(data)
   const sharp = requireSharp()
   try {
     return await imageMetadata(sharp(data, { failOn: 'error', limitInputPixels: false }))
@@ -114,6 +136,7 @@ export interface DecodedImageLimits {
  * @returns verified format and dimensions.
  */
 export async function detectImage(data: Uint8Array, limits?: DecodedImageLimits): Promise<DetectedImage> {
+  assertRasterSignature(data)
   const sharp = requireSharp()
   try {
     const image = sharp(data, { failOn: 'error', limitInputPixels: false })
