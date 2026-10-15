@@ -209,6 +209,24 @@ describe('BrowserAuth', () => {
     })
   })
 
+  it('keeps the rest of the query when redirecting after a token exchange', async () => {
+    const auth = await createAuth(new RecordCredentials())
+    const authority = '127.0.0.1:3080'
+    const launch = new URL(auth.authenticatedUrl(`http://${authority}`))
+    launch.searchParams.set('view', 'library')
+    launch.searchParams.append('item', 'a b')
+    const fresh = response()
+    expect(auth.authorizeIndex(request(`${launch.pathname}${launch.search}`, authority), fresh.value)).toBe(false)
+    expect(fresh.state.headers?.location).toBe('./?view=library&item=a+b')
+    expect(fresh.state.headers?.location).not.toContain('token')
+
+    const cookie = fresh.state.headers?.['set-cookie']?.split(';', 1)[0]
+    if (cookie === undefined) throw new Error('token exchange did not set a cookie')
+    const signedIn = response()
+    expect(auth.authorizeIndex(request(`${launch.pathname}${launch.search}`, authority, { cookie }), signedIn.value)).toBe(false)
+    expect(signedIn.state.headers?.location).toBe('./?view=library&item=a+b')
+  })
+
   it('keeps HTTPS port 443 distinct from HTTP port 80 with one signing secret', async () => {
     const auth = await createAuth(new RecordCredentials())
     const plain = exchange(auth, 'harness.example')

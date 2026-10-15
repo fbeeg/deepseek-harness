@@ -15,6 +15,20 @@ const AUTH_RECORD_KEY = credentialKey('client-connection', 'browser-session')
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1000
 const SECRET_BYTES = 32
 const TOKEN_QUERY = 'token'
+
+/**
+ * The redirect target after a launch-token exchange: the index with every query
+ * parameter except the token, so deep links that travel with a sign-in URL
+ * (`/?token=...&view=library`) survive the 303. The token is never echoed back.
+ * @param url - the parsed request URL.
+ * @returns `./` plus the remaining query, if any.
+ */
+function indexLocation(url: URL): string {
+  const rest = new URLSearchParams(url.searchParams)
+  rest.delete(TOKEN_QUERY)
+  const query = rest.toString()
+  return query === '' ? './' : `./?${query}`
+}
 const COOKIE_PREFIX = 'dsh-auth-'
 const COOKIE_PAYLOAD_VERSION = 1
 const STORED_SECRET_VERSION = 1
@@ -278,7 +292,7 @@ export class BrowserAuth {
         }, this.secret)
         res.writeHead(303, {
           'cache-control': 'no-store',
-          'location': './',
+          'location': indexLocation(url),
           'referrer-policy': 'no-referrer',
           'set-cookie': sessionCookie(
             cookieName(authority), value, expiresAt, Math.floor(this.maxAgeMilliseconds / 1000), secure,
@@ -290,7 +304,7 @@ export class BrowserAuth {
       if (req.method === 'GET' && url.pathname === '/' && this.isAuthenticated(req, secure)) {
         res.writeHead(303, {
           'cache-control': 'no-store',
-          'location': './',
+          'location': indexLocation(url),
           'referrer-policy': 'no-referrer',
         })
         res.end()
