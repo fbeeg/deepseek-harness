@@ -604,6 +604,14 @@ describe('real Loader composition', () => {
     await expect(tlsRequest(server.port, '/tls', fixture.ca)).rejects.toThrow()
   })
 
+  it('keeps idle sockets open longer than common proxy pools', { timeout: 60_000 }, async () => {
+    const loaded = await loadComposition()
+    const { server } = loaded.webServer as unknown as { server: import('node:http').Server }
+    // Node's 5 s default closes sockets a reverse proxy still considers reusable (intermittent 502s).
+    expect(server.keepAliveTimeout).toBeGreaterThanOrEqual(90_000)
+    expect(server.headersTimeout).toBeGreaterThan(server.keepAliveTimeout)
+  })
+
   it('treats an explicit null tls as no TLS and keeps serving plain HTTP', { timeout: 60_000 }, async () => {
     // A user's `tls:` with no value reaches the service as null through the schema.
     const loaded = await loadComposition(0, false, '127.0.0.1', null)

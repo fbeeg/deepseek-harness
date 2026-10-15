@@ -106,6 +106,10 @@ export interface Config {
 const DEFAULT_COMPRESSION = 'none' as const
 const DEFAULT_COMPRESSION_LEVEL = 1
 const DEFAULT_COMPRESSION_THRESHOLD_BYTES = 1024
+/** Idle keep-alive window, longer than the idle reuse window of common tunnels and proxies (about 90 s). */
+const KEEP_ALIVE_TIMEOUT_MS = 110_000
+/** Node requires headersTimeout to exceed keepAliveTimeout. */
+const HEADERS_TIMEOUT_MS = 120_000
 
 interface ResolvedConfig extends Config {
   compression: 'none' | 'gzip'
@@ -477,6 +481,12 @@ export class WebServer extends Service {
           socket.once('close', () => { this.tlsConnections.delete(socket) })
         })
       }
+      // Node's default keep-alive timeout (5 s) is shorter than the idle reuse window of
+      // common reverse proxies, tunnels and CDNs (tens of seconds). A proxy that writes onto
+      // a socket Node is already closing sees an empty reply and reports a 502. Keep the
+      // socket open longer than any usual upstream pool; headersTimeout must exceed it.
+      this.server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS
+      this.server.headersTimeout = HEADERS_TIMEOUT_MS
       this.server.on('upgrade', (req, socket, head) => {
         const onError = (error: Error): void => {
           this.ctx.logger.warn(error)
