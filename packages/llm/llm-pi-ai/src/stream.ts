@@ -39,6 +39,15 @@ export function mapUsage(usage: PiUsage): TokenUsage {
 // wrapper a bare `terminated`, so we are left pattern-matching terse words here.
 // If pi-ai ever forwards the original Error (or a fetch/dispatcher hook that lets
 // us capture the cause ourselves), classify on `code`/`cause` instead of text.
+/** Stable failure code for a 403 that says the key may not use the requested model. Not retryable. */
+export const MODEL_NOT_ALLOWED_CODE = 'MODEL_NOT_ALLOWED'
+
+function isModelNotAllowedError(message: string): boolean {
+  return /\b403\b/.test(message)
+    && /model/i.test(message)
+    && /not allowed|not permitted|can only access|no access/i.test(message)
+}
+
 function classifyPiAiError(message: string): string {
   if (/\b(?:401|403)\b/.test(message)) return 'AUTH'
   if (isQuotaExceededError(message)) return QUOTA_EXCEEDED_CODE
@@ -122,6 +131,18 @@ export function mapStopReason(message: AssistantMessage, contextWindow?: number)
     }
     case 'error': {
       const text = message.errorMessage ?? 'pi-ai stream error'
+      if (isModelNotAllowedError(text)) {
+        // The key authenticated; it just does not grant this model. Reporting that as AUTH
+        // sends the operator to the credentials and the UI blanks the provider text (it can
+        // echo a credential), so say what happened without quoting the provider payload.
+        return {
+          kind: 'error',
+          failure: {
+            message: `model not allowed for this key: "${message.model}" (HTTP 403). The provider key does not grant access to this model.`,
+            code: MODEL_NOT_ALLOWED_CODE,
+          },
+        }
+      }
       return { kind: 'error', failure: { message: text, code: classifyPiAiError(text) } }
     }
   }

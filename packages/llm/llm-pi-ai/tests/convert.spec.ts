@@ -897,6 +897,25 @@ describe('mapStopReason / mapUsage', () => {
       .toEqual({ kind: 'error', failure: { message: 'pi-ai stream error', code: 'PI_AI_ERROR' } })
   })
 
+  it('reports a 403 that denies the model as MODEL_NOT_ALLOWED without quoting the provider payload', () => {
+    const denied = mapStopReason(assistant({
+      stopReason: 'error',
+      model: 'some-alias',
+      errorMessage: '403: {"message":"key not allowed to access model. This key can only access models=[\'other\'] sk-secret-echo"}',
+    }))
+    expect(denied).toEqual({
+      kind: 'error',
+      failure: {
+        message: 'model not allowed for this key: "some-alias" (HTTP 403). The provider key does not grant access to this model.',
+        code: 'MODEL_NOT_ALLOWED',
+      },
+    })
+    expect(JSON.stringify(denied)).not.toContain('sk-secret-echo')
+    // Other 401/403 failures stay AUTH.
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'HTTP 403: forbidden' })))
+      .toMatchObject({ kind: 'error', failure: { code: 'AUTH' } })
+  })
+
   it('maps routable HTTP-ish error messages to stable codes', () => {
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'HTTP 401: bad key' })))
       .toMatchObject({ kind: 'error', failure: { code: 'AUTH' } })
