@@ -73,6 +73,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
   private readonly peers = new Map<PeerId, PeerRecord>()
   private readonly owner: Context
   private disposed = false
+  private readonly channels = new Set<string>()
   private readonly interceptors = new Map<string, ConnectionRpcInterceptor>()
   private readonly fetchRoutes = new Map<string, RegisteredFetchRoute>()
 
@@ -270,10 +271,21 @@ export class HostConnectionService extends Service implements HostConnectionHand
         await bridge(req, res, fetchHandler, admission.peer)
       },
     }
-    return owner.effect(
-      () => owner.webServer.register(route),
-      `client-connection: ${channel} rpc channel`,
-    )
+    return owner.effect(() => {
+      if (this.channels.has(channel)) {
+        throw new Error(`connection: RPC channel ${JSON.stringify(channel)} is already registered`)
+      }
+      this.channels.add(channel)
+      // `owner` resolves services through this service's fiber, which does not
+      // inject webServer; mount the route in an inject scope, as the /api route does.
+      const carrier = this.owner.inject(['webServer'], (webCtx) => {
+        webCtx.effect(() => webCtx.webServer.register(route), `client-connection: ${channel} rpc route`)
+      })
+      return async () => {
+        await carrier.dispose()
+        this.channels.delete(channel)
+      }
+    }, `client-connection: ${channel} rpc channel`)
   }
 
   private registerInterceptor(

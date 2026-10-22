@@ -449,8 +449,8 @@ describe('connection node half', () => {
       calls.push({ endpoint, payload })
       return { ok: true, value: { accepted: true } }
     })
+    await expect.poll(() => routes.find(candidate => candidate.path === '/rpc')).toBeDefined()
     const route = routes.find(candidate => candidate.path === '/rpc')
-    expect(route).toBeDefined()
 
     const request: ClientRequest = {
       type: 'client-request',
@@ -475,11 +475,56 @@ describe('connection node half', () => {
     }])
 
     expect(() => connection.rpc.handle('/rpc', async () => ({ ok: true, value: null })))
-      .toThrow(/duplicate route/)
+      .toThrow('RPC channel "/rpc" is already registered')
     await remove()
     expect(routes.map(candidate => candidate.path)).toEqual([API_PATH, '/connect'])
     await fiber.dispose()
     expect(routes).toHaveLength(0)
+  })
+
+  it('mounts a consumer plugin RPC channel on a webServer provided by a sibling plugin', async () => {
+    const ctx = new Context()
+    const routes: WebRoute[] = []
+    provideBrowserCredentials(ctx)
+    const web = ctx.plugin((webCtx) => {
+      webCtx.provide('webServer', fakeHttpServer(routes, []) as WebServer)
+    })
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    const consumer = ctx.plugin({
+      inject: ['connection'],
+      apply: (consumerCtx: Context) => {
+        consumerCtx.connection.rpc.handle('/rpc', async () => ({ ok: true, value: { accepted: true } }))
+      },
+    })
+    try {
+      await Promise.all([web.await(), fiber.await(), consumer.await()])
+      await expect.poll(() => routes.map(candidate => candidate.path)).toContain('/rpc')
+
+      const connection = ctx.get('connection') as HostConnectionHandle
+      const request: ClientRequest = {
+        type: 'client-request',
+        rpcId: RpcId('rpc-sibling'),
+        method: 'goals/create',
+        payload: {},
+      }
+      const result = fakeResponse()
+      await routes.find(candidate => candidate.path === '/rpc')!.handler(fakePost({
+        host: '127.0.0.1:3080',
+        cookie: browserCookie(connection, '127.0.0.1:3080'),
+      }, '/rpc/goals/create', request), result.response)
+      expect(JSON.parse(String(result.state.body))).toEqual({
+        type: 'server-response',
+        rpcId: 'rpc-sibling',
+        result: { ok: true, value: { accepted: true } },
+      })
+
+      await consumer.dispose()
+      expect(routes.map(candidate => candidate.path)).toEqual([API_PATH, '/connect'])
+    } finally {
+      await consumer.dispose()
+      await fiber.dispose()
+      await web.dispose()
+    }
   })
 
   it('dispatches claimed /api endpoints and withdraws the claim', async () => {
@@ -620,6 +665,7 @@ describe('connection node half', () => {
       if (endpoint === 'fail') throw new Error('handler broke')
       return { ok: true, value: null }
     })
+    await expect.poll(() => routes.find(candidate => candidate.path === '/rpc')).toBeDefined()
     const route = routes.find(candidate => candidate.path === '/rpc')!
     const harnessHeaders = {
       host: 'harness.example',
