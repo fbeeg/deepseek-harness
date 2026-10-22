@@ -81,6 +81,8 @@ export const SESSION_QUERY_SQLITE_DEFAULT_LIMIT = 20
 export const SESSION_QUERY_SQLITE_MAX_LIMIT = 100
 /** Default maximum snippet length in Unicode code points. */
 export const SESSION_QUERY_SQLITE_SNIPPET_CHARS = 240
+/** Default size in bytes SQLite truncates the journal to once it is reset (64 MiB). */
+export const SESSION_QUERY_SQLITE_JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
 
 // One transient source change gets a retry; repeated churn fails rather than monopolizing the queue.
 const STABLE_OBSERVATION_ATTEMPTS = 2
@@ -106,6 +108,13 @@ export interface Config extends SessionQueryConfig {
   openAt?: OpenAt
   /** SQLite journal mode. Defaults to `wal`. */
   journalMode?: JournalMode
+  /**
+   * SQLite `journal_size_limit` in bytes: a WAL (or a `persist`/`truncate`
+   * rollback journal) that a large reconciliation grew is truncated back to
+   * this size once SQLite resets it. `-1` leaves the journal unbounded.
+   * Defaults to 64 MiB.
+   */
+  journalSizeLimit?: number
   /** Page size when a request omits `limit`. At most `Number.MAX_SAFE_INTEGER - 1`; defaults to 20. */
   defaultLimit?: number
   /** Largest accepted page size. At most `Number.MAX_SAFE_INTEGER - 1`; defaults to 100. */
@@ -122,6 +131,7 @@ interface ResolvedConfig {
   path: string
   openAt: OpenAt
   journalMode: JournalMode
+  journalSizeLimit: number
   defaultLimit: number
   maxLimit: number
   snippetChars: number
@@ -207,6 +217,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     path: z.string().required(),
     openAt: z.union(['startup', 'first-search', 'never'] as const).default('startup'),
     journalMode: z.union(['wal', 'delete', 'truncate', 'persist'] as const).default('wal'),
+    journalSizeLimit: z.number()
+      .step(1)
+      .min(-1)
+      .max(Number.MAX_SAFE_INTEGER)
+      .default(SESSION_QUERY_SQLITE_JOURNAL_SIZE_LIMIT),
     defaultLimit: z.number().step(1).min(1).max(SQLITE_MAX_PAGE_LIMIT).default(SESSION_QUERY_SQLITE_DEFAULT_LIMIT),
     maxLimit: z.number().step(1).min(1).max(SQLITE_MAX_PAGE_LIMIT).default(SESSION_QUERY_SQLITE_MAX_LIMIT),
     snippetChars: z.number().step(1).min(1).default(SESSION_QUERY_SQLITE_SNIPPET_CHARS),
@@ -358,7 +373,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   }
 
   private async _open(): Promise<void> {
-    this._db = await openSearchDatabase(this.config.path, this.config.journalMode)
+    this._db = await openSearchDatabase(this.config.path, this.config.journalMode, this.config.journalSizeLimit)
     const state = this._db.prepare(
       'SELECT global_generation FROM search_state WHERE singleton = 1',
     ).get() as { global_generation: number }
@@ -571,7 +586,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _deleteSession(source: 'persisted' | 'live', id: SessionId): void {
     const db = this._requireDb()
     if (source === 'persisted') {
-      db.prepare('DELETE FROM persisted_docs WHERE session_id = ?').run(id)
+      // Delete by rowid: filtering persisted_docs on its UNINDEXED session_id scans the whole index.
+      db.prepare(
+        'DELETE FROM persisted_docs WHERE rowid IN (SELECT doc_rowid FROM persisted_doc_rows WHERE session_id = ?)',
+      ).run(id)
+      db.prepare('DELETE FROM persisted_doc_rows WHERE session_id = ?').run(id)
       db.prepare('DELETE FROM persisted_sessions WHERE id = ?').run(id)
     } else {
       db.prepare('DELETE FROM temp.live_docs WHERE session_id = ?').run(id)
@@ -599,9 +618,10 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       INSERT INTO persisted_docs (text, session_id, seq, type, time, surface, codepoint_length)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
+    const record = db.prepare('INSERT INTO persisted_doc_rows (session_id, doc_rowid) VALUES (?, ?)')
     for (const document of entry.documents) {
       const text = sanitizeFtsText(document.text)
-      insert.run(
+      const { lastInsertRowid } = insert.run(
         text,
         document.sessionId,
         document.seq,
@@ -610,6 +630,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         document.surface,
         Array.from(text).length,
       )
+      record.run(document.sessionId, lastInsertRowid)
     }
   }
 
@@ -1022,6 +1043,7 @@ function resolveConfig(config: Config): ResolvedConfig {
     path: config.path,
     openAt: config.openAt ?? 'startup',
     journalMode: config.journalMode ?? 'wal',
+    journalSizeLimit: config.journalSizeLimit ?? SESSION_QUERY_SQLITE_JOURNAL_SIZE_LIMIT,
     defaultLimit: config.defaultLimit ?? SESSION_QUERY_SQLITE_DEFAULT_LIMIT,
     maxLimit: config.maxLimit ?? SESSION_QUERY_SQLITE_MAX_LIMIT,
     snippetChars: config.snippetChars ?? SESSION_QUERY_SQLITE_SNIPPET_CHARS,
@@ -1059,6 +1081,9 @@ function resolveConfig(config: Config): ResolvedConfig {
   }
   const journalModes: readonly string[] = ['wal', 'delete', 'truncate', 'persist']
   if (!journalModes.includes(resolved.journalMode)) throw invalidConfig('journalMode is not supported')
+  if (!Number.isSafeInteger(resolved.journalSizeLimit) || resolved.journalSizeLimit < -1) {
+    throw invalidConfig('journalSizeLimit must be -1 or a non-negative safe integer')
+  }
   return resolved
 }
 

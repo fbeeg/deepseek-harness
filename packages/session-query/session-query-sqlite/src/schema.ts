@@ -5,7 +5,7 @@ import { mkdir, open } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
 /** Current derived-index schema version. Incompatible versions reset in place. */
-export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 8
+export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 9
 
 /** SQLite application id protecting unrelated databases from derived resets. */
 export const SESSION_QUERY_SQLITE_APPLICATION_ID = 0x44534851
@@ -22,6 +22,7 @@ const DERIVED_USER_TABLES = new Set([
   'persisted_docs_content',
   'persisted_docs_docsize',
   'persisted_docs_config',
+  'persisted_doc_rows',
 ])
 
 /**
@@ -41,9 +42,14 @@ async function createDatabaseFile(path: string): Promise<void> {
  * Open, validate, and initialize persistent and connection-local schemas.
  * @param path - dedicated derived-index path or `:memory:`; missing filesystem paths are created owner-only.
  * @param journalMode - validated SQLite journal mode.
+ * @param journalSizeLimit - validated `PRAGMA journal_size_limit` in bytes; `-1` leaves the journal unbounded.
  * @returns initialized database handle owned by the search service.
  */
-export async function openSearchDatabase(path: string, journalMode: JournalMode): Promise<DatabaseSync> {
+export async function openSearchDatabase(
+  path: string,
+  journalMode: JournalMode,
+  journalSizeLimit: number,
+): Promise<DatabaseSync> {
   const actual = path === ':memory:' ? path : resolve(path)
   if (actual !== ':memory:') {
     await mkdir(dirname(actual), { recursive: true, mode: 0o700 })
@@ -68,6 +74,8 @@ export async function openSearchDatabase(path: string, journalMode: JournalMode)
     // Apply mutating pragmas only after refusing foreign or canonical files.
     // journalMode is a validated closed union, not caller-controlled SQL.
     db.exec(`PRAGMA journal_mode = ${journalMode.toUpperCase()}`)
+    // journalSizeLimit is a validated safe integer, not caller-controlled SQL.
+    db.exec(`PRAGMA journal_size_limit = ${journalSizeLimit}`)
     ensurePersistentSchema(db)
     ensureTemporarySchema(db)
     return db
@@ -134,6 +142,16 @@ function ensurePersistentSchema(db: DatabaseSync): void {
       codepoint_length UNINDEXED,
       tokenize = 'unicode61'
     )
+  `)
+  // persisted_docs.session_id is UNINDEXED and FTS5 has no secondary indexes,
+  // so a delete filtered on it visits every document. This table maps each
+  // session to its document rowids, which turns that delete into rowid lookups.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS persisted_doc_rows (
+      session_id TEXT NOT NULL,
+      doc_rowid  INTEGER NOT NULL,
+      PRIMARY KEY (session_id, doc_rowid)
+    ) STRICT, WITHOUT ROWID
   `)
   db.exec(`PRAGMA user_version = ${SESSION_QUERY_SQLITE_SCHEMA_VERSION}`)
 }

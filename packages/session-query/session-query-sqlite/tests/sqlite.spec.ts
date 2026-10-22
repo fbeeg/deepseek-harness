@@ -24,6 +24,7 @@ import type {
 } from '@deepseek-ai/dsh-session-persistence'
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SqliteSessionQueryEngine, {
+  SESSION_QUERY_SQLITE_JOURNAL_SIZE_LIMIT,
   SESSION_QUERY_SQLITE_SCHEMA_VERSION,
 } from '@deepseek-ai/dsh-session-query-sqlite'
 import {
@@ -60,15 +61,32 @@ function header(id: string, createdAt = 1, extra: Partial<SessionHeader> = {}): 
 }
 
 function messageEvents(text: string, time = 1): SessionEvent[] {
-  return [{
+  return messageSeries([text], time)
+}
+
+function messageSeries(texts: readonly string[], time = 1): SessionEvent[] {
+  return texts.map((text, index): SessionEvent => ({
     type: 'user/message',
-    seq: SessionSeq(0),
+    seq: SessionSeq(index),
     time,
     data: createUserMessage({
       content: [{ type: 'text', text }], source: { kind: 'user' },
     }),
     surfaceOp: 'append',
-  }]
+  }))
+}
+
+function indexedPersistedTexts(path: string): Record<string, string[]> {
+  const db = new DatabaseSync(path, { readOnly: true })
+  try {
+    const rows = db.prepare('SELECT session_id, text FROM persisted_docs ORDER BY session_id, rowid')
+      .all() as Array<{ session_id: string; text: string }>
+    const texts: Record<string, string[]> = {}
+    for (const row of rows) (texts[row.session_id] ??= []).push(row.text)
+    return texts
+  } finally {
+    db.close()
+  }
 }
 
 function expectCode(code: SessionQueryErrorCode): Error {
@@ -215,6 +233,8 @@ describe('SQLite session search', () => {
   it('defaults and validates opening policy and persisted inspection concurrency through its Cordis config', async () => {
     const defaultCtx = await liveContext()
     expect((defaultCtx.sessionQuery as SqliteSessionQueryEngine).config.openAt).toBe('startup')
+    expect((defaultCtx.sessionQuery as SqliteSessionQueryEngine).config.journalSizeLimit)
+      .toBe(SESSION_QUERY_SQLITE_JOURNAL_SIZE_LIMIT)
     expect((defaultCtx.sessionQuery as SqliteSessionQueryEngine).config.persistedReadConcurrency)
       .toBe(SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY)
 
@@ -717,6 +737,8 @@ describe('SQLite session search', () => {
       { path: ':memory:', defaultLimit: 3, maxLimit: 2 },
       { path: ':memory:', openAt: 'later' },
       { path: ':memory:', journalMode: 'memory' },
+      { path: ':memory:', journalSizeLimit: -2 },
+      { path: ':memory:', journalSizeLimit: 1.5 },
     ]) {
       const direct = new Context()
       await direct.plugin(SessionStore)
@@ -1180,6 +1202,73 @@ describe('SQLite reconciliation and source lifecycle', () => {
     expect(after.has(added.id)).toBe(true)
   })
 
+  it('replaces and deletes only the reconciled persisted sessions\' documents', async () => {
+    const path = await temporaryPath()
+    const kept = header('kept')
+    const changed = header('changed')
+    const removed = header('removed')
+    TestPersistence.reset([
+      { meta: kept, events: messageSeries(['kept needle one', 'kept needle two', 'kept needle three']) },
+      { meta: changed, events: messageSeries(['stale needle one', 'stale needle two']) },
+      { meta: removed, events: messageSeries(['removed needle one', 'removed needle two']) },
+    ])
+    const ctx = await liveContext({ path })
+    const persistence = await ctx.plugin(TestPersistence)
+    await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    const before = indexedPersistedTexts(path)
+    expect(Object.keys(before).sort()).toEqual([changed.id, kept.id, removed.id].sort())
+
+    TestPersistence.set({ meta: changed, events: messageSeries(['fresh needle one', 'fresh needle two', 'fresh needle three']) })
+    TestPersistence.entries.delete(removed.id)
+    await expect(ctx.sessionQuery.searchSessions({ query: 'stale' })).resolves.toEqual({ items: [] })
+
+    const after = indexedPersistedTexts(path)
+    expect(Object.keys(after).sort()).toEqual([changed.id, kept.id].sort())
+    expect(after[kept.id]).toEqual(before[kept.id])
+    expect(after[changed.id]).toEqual(['fresh needle one', 'fresh needle two', 'fresh needle three'])
+    await persistence.dispose()
+    await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
+  })
+
+  it('removes a changed or deleted persisted session\'s documents without scanning the whole index', async () => {
+    const path = await temporaryPath()
+    const changed = header('changed')
+    const removed = header('removed')
+    TestPersistence.reset([
+      { meta: header('bystander'), events: messageSeries(['bystander needle one', 'bystander needle two']) },
+      { meta: changed, events: messageEvents('stale needle') },
+      { meta: removed, events: messageEvents('removed needle') },
+    ])
+    const ctx = await liveContext({ path })
+    const persistence = await ctx.plugin(TestPersistence)
+    await ctx.sessionQuery.searchSessions({ query: 'needle' })
+
+    TestPersistence.set({ meta: changed, events: messageEvents('fresh needle') })
+    TestPersistence.entries.delete(removed.id)
+    const prepare = vi.spyOn(DatabaseSync.prototype, 'prepare')
+    let statements: string[]
+    try {
+      await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    } finally {
+      statements = prepare.mock.calls.map(([sql]) => sql)
+      prepare.mockRestore()
+    }
+    const deletes = statements.filter(sql => /^\s*DELETE\s+FROM\s+persisted_docs\b/iu.test(sql))
+    expect(deletes.length).toBeGreaterThan(0)
+    const probe = new DatabaseSync(path, { readOnly: true })
+    try {
+      for (const sql of deletes) {
+        const plan = probe.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{ detail: string }>
+        // FTS5 plans a scan with neither a rowid nor a MATCH constraint as "INDEX 0:": it visits every indexed row.
+        expect(plan.map(row => row.detail), sql).not.toContain('SCAN persisted_docs VIRTUAL TABLE INDEX 0:')
+      }
+    } finally {
+      probe.close()
+    }
+    await persistence.dispose()
+    await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
+  })
+
   it('drops connection-local live overlays on reopen and retains persistent bases', async () => {
     const path = await temporaryPath()
     const shared = header('shared', 10)
@@ -1272,6 +1361,25 @@ describe('SQLite schema, cancellation, and real persistence integration', () => 
     expect((await stat(path)).mode & 0o777).toBe(0o600)
     expect((await stat(`${path}-wal`)).mode & 0o777).toBe(0o600)
     expect((await stat(`${path}-shm`)).mode & 0o777).toBe(0o600)
+    await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
+  })
+
+  it('truncates the WAL to journalSizeLimit after a large reconciliation is checkpointed', async () => {
+    const path = await temporaryPath()
+    const journalSizeLimit = 256 * 1024
+    const bulky = Array.from({ length: 192 }, (_, index) => `bulky needle ${index} ${'filler '.repeat(4096)}`)
+    TestPersistence.reset([{ meta: header('bulky'), events: messageSeries(bulky) }])
+    const ctx = await liveContext({ path, journalSizeLimit })
+    const persistence = await ctx.plugin(TestPersistence)
+    await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    // That reconciliation outgrows both the limit and SQLite's automatic checkpoint threshold; the
+    // next write restarts the WAL from its beginning and truncates the file when it commits.
+    expect((await stat(`${path}-wal`)).size).toBeGreaterThan(journalSizeLimit)
+    TestPersistence.set({ meta: header('small'), events: messageEvents('small needle') })
+    await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    expect((await stat(`${path}-wal`)).size).toBeLessThanOrEqual(journalSizeLimit)
+    expect((ctx.sessionQuery as SqliteSessionQueryEngine).config.journalSizeLimit).toBe(journalSizeLimit)
+    await persistence.dispose()
     await (ctx.sessionQuery as SqliteSessionQueryEngine).close()
   })
 
