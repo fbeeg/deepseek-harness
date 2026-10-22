@@ -112,3 +112,16 @@ it('reports opening failure and releases Views even when committed roots are sti
   unmount()
   expect(release).toHaveBeenCalledOnce()
 })
+
+it('does not report a View retired before its Session finished opening', async () => {
+  const r = await runtime()
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const views = new SidebarSessionViews(r.sessions)
+  owners.push(views)
+  views.select(A)
+  const a = views.source.getSnapshot()[0]!
+  views.select(B)
+  await expect(a.reference.ready).rejects.toThrow(`Session reference "${A}" is released`)
+  await views.source.getSnapshot()[0]!.reference.ready
+  expect(error).not.toHaveBeenCalled()
+})
